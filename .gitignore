@@ -1,0 +1,17 @@
+.venv/
+.pytest_tmp/
+artifacts/
+AppData/
+*.log
+__pycache__/
+*.py[cod]
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+*.egg-info/
+data/*.db
+.streamlit/credentials.toml
+.env
+node_modules/
+dist/
+.vercel/

@@ -1,0 +1,29 @@
+[
+  {
+    "plan_id": "COMM-CA-001",
+    "payer": "Northstar Commercial",
+    "drug_name": "StepOne Inhaler",
+    "tier": "non-preferred",
+    "prior_authorization_required": true,
+    "copay_assistance_eligible": true,
+    "formulary_alternatives": ["BreathEase HFA", "CortiAir Daily"]
+  },
+  {
+    "plan_id": "COMM-NY-044",
+    "payer": "UnionCare Commercial",
+    "drug_name": "GLP Access",
+    "tier": "preferred-specialty",
+    "prior_authorization_required": true,
+    "copay_assistance_eligible": true,
+    "formulary_alternatives": ["GlucoLite Weekly", "MetaboSure"]
+  },
+  {
+    "plan_id": "GOV-TX-210",
+    "payer": "PublicCare Advantage",
+    "drug_name": "StepOne Inhaler",
+    "tier": "preferred",
+    "prior_authorization_required": false,
+    "copay_assistance_eligible": false,
+    "formulary_alternatives": ["BreathEase HFA"]
+  }
+]
