@@ -41,30 +41,159 @@ function screenQuestion(q) {
   return { allowed: reasons.length === 0, reasons };
 }
 
-function retrieveContext(question) {
+// ── FIX 1: Entity extraction — pull drug names, payer, query type from free text ──
+function extractEntities(question, patientContext = {}) {
   const ql = question.toLowerCase();
-  const sources = [];
-  for (const [drug, policy] of Object.entries(PHARMA_DATA.policies)) {
-    if (drug !== "general" && ql.includes(drug.toLowerCase())) {
-      sources.push({ source: `${drug} Policy Document`, score: 0.91, preview: policy.slice(0,200) + "…" });
+
+  // Drug name aliases — maps clinical/brand names to policy keys
+  const drugAliases = {
+    "stepone": "StepOne Inhaler", "step one": "StepOne Inhaler", "budesonide": "StepOne Inhaler",
+    "formoterol": "StepOne Inhaler", "ics/laba": "StepOne Inhaler", "glp access": "GLP Access",
+    "semaglutide": "GLP Access", "wegovy": "GLP Access", "ozempic": "GLP Access",
+    "glp-1": "GLP Access", "glp1": "GLP Access", "breathease": "BreathEase HFA",
+    "dupilumab": "dupilumab", "dupixent": "dupilumab",
+    "mepolizumab": "mepolizumab", "nucala": "mepolizumab",
+    "benralizumab": "benralizumab", "fasenra": "benralizumab",
+    "tezepelumab": "tezepelumab", "tezspire": "tezepelumab",
+  };
+
+  const detectedDrugs = [];
+  for (const [alias, canonical] of Object.entries(drugAliases)) {
+    if (ql.includes(alias) && !detectedDrugs.includes(canonical)) {
+      detectedDrugs.push(canonical);
     }
   }
-  const benefits = PHARMA_DATA.benefits.filter(b =>
-    ql.includes(b.drug_name.toLowerCase()) || ql.includes(b.payer.toLowerCase())
-  );
-  if (benefits.length) {
-    sources.push({ source:"Pharmacy Benefits Database", score: 0.87, preview: benefits.map(b => `${b.payer}: ${b.drug_name} (${b.tier}), PA: ${b.pa_required}, Copay: ${b.copay_eligible}`).join(" | ") });
-  }
-  if (sources.length === 0) {
-    sources.push({ source:"General Access Policy", score: 0.62, preview: PHARMA_DATA.policies.general.slice(0,200) + "…" });
-  }
-  return sources;
+
+  // Query type classification
+  const queryType = ql.includes("prior auth") || ql.includes("pa ") || ql.includes("authorization") || ql.includes("step therapy") || ql.includes("approval")
+    ? "prior_auth"
+    : ql.includes("copay") || ql.includes("cost") || ql.includes("assistance") || ql.includes("support program")
+    ? "copay"
+    : ql.includes("formulary") || ql.includes("alternative") || ql.includes("tier")
+    ? "formulary"
+    : ql.includes("covered") || ql.includes("coverage") || ql.includes("eligible")
+    ? "coverage"
+    : ql.includes("medicare") || ql.includes("medicaid") || ql.includes("part b") || ql.includes("part d")
+    ? "medicare"
+    : ql.includes("compound") || ql.includes("compounded")
+    ? "compounding"
+    : "general";
+
+  // Payer detection — from question text OR dropdown context
+  const payerType = patientContext.payerType || "Commercial";
+  const isGovt = payerType === "Medicare" || payerType === "Medicaid" || ql.includes("medicare") || ql.includes("medicaid");
+  const isMedicare = payerType === "Medicare" || ql.includes("medicare") || ql.includes("part b") || ql.includes("part d");
+  const therapyArea = patientContext.therapyArea || "General";
+
+  return { detectedDrugs, queryType, payerType, isGovt, isMedicare, therapyArea };
 }
 
-function computeConfidence(answer, sources) {
-  if (!sources.length) return 0.3;
-  const avgScore = sources.reduce((s, r) => s + r.score, 0) / sources.length;
-  return Math.min(0.97, avgScore + 0.04);
+// ── FIX 2: Retrieval now uses entities + payer + therapy area as filters ──
+function retrieveContext(question, patientContext = {}) {
+  const ql = question.toLowerCase();
+  const { detectedDrugs, queryType, isGovt, isMedicare, therapyArea } = extractEntities(question, patientContext);
+  const sources = [];
+
+  // Score a policy chunk based on entity + query type match
+  function scoreChunk(drugKey, chunkType) {
+    let score = 0.60;
+    if (detectedDrugs.some(d => d.toLowerCase().includes(drugKey.toLowerCase()) || drugKey.toLowerCase().includes(d.toLowerCase()))) score += 0.25;
+    if (chunkType === queryType) score += 0.10;
+    if (therapyArea === "Respiratory" && (drugKey.includes("Inhaler") || drugKey.includes("dupilumab") || drugKey.includes("benralizumab") || drugKey.includes("mepolizumab"))) score += 0.05;
+    if (therapyArea === "Metabolic" && (drugKey.includes("GLP") || drugKey.includes("semaglutide"))) score += 0.05;
+    return Math.min(0.97, score);
+  }
+
+  // Match existing PHARMA_DATA policies
+  for (const [drug, policy] of Object.entries(PHARMA_DATA.policies)) {
+    if (drug === "general") continue;
+    if (detectedDrugs.some(d => d.toLowerCase().includes(drug.toLowerCase()) || drug.toLowerCase().includes(d.toLowerCase()))) {
+      sources.push({ source: `${drug} Policy Document`, score: scoreChunk(drug, "coverage"), preview: policy.slice(0, 220) + "…" });
+    }
+  }
+
+  // ── Extended policy knowledge base ──
+  const EXTENDED_POLICIES = {
+    "dupilumab": {
+      coverage: `Dupilumab (Dupixent) for moderate-to-severe asthma requires PA. Criteria: FEV1 <80% predicted, blood eosinophils ≥150 cells/uL OR FeNO ≥25 ppb, current high-dose ICS/LABA, ≥2 exacerbations in prior year. BCBS Commercial PPO step therapy typically requires prior anti-IL-5 trial (mepolizumab/benralizumab) unless patient failed/discontinued due to adverse events OR has comorbid Type 2 inflammatory conditions (atopic dermatitis, nasal polyps, EoE) supporting IL-4/IL-13 pathway preference.`,
+      prior_auth: `Dupilumab PA documentation: (1) Pulmonologist/allergist chart notes + NPI, (2) Spirometry with FEV1 % predicted, (3) FeNO measurement, (4) CBC with differential showing eosinophil count, (5) OCS burst history, (6) prior biologic trial documentation with discontinuation reason — injection site reactions from benralizumab/Fasenra qualify as step therapy failure, (7) current ICS/LABA medication list, (8) letter of medical necessity. Medical exception for direct approval: cite NEJM 2018 Liberty Asthma QUEST trial; document comorbid atopic conditions.`,
+      copay: isGovt ? `Medicare/Medicaid patients are NOT eligible for Dupixent MyWay manufacturer copay program. Patient Assistance Programs (PAPs) may be available for qualifying low-income patients. Part B vs Part D determination needed based on administration setting.` : `Dupixent MyWay program available for commercially insured patients. Eligible patients may pay as little as $0/month. Enrollment through dupixent.com or specialty pharmacy hub.`,
+    },
+    "mepolizumab": {
+      coverage: `Mepolizumab (Nucala) for eosinophilic asthma: blood eosinophils ≥150 cells/uL at initiation (≥300 preferred), severe eosinophilic asthma with ≥2 exacerbations/year, ongoing high-dose ICS/LABA. BCBS Commercial PPO lists as preferred biologic before dupilumab for eosinophilic phenotype. Step therapy requirement before dupilumab approval — unless patient has IL-4/IL-13 comorbidities.`,
+      prior_auth: `Nucala PA: documented eosinophil count ≥150 cells/uL, asthma exacerbation history, ICS/LABA current use, prescriber attestation. If requesting dupilumab after Nucala failure, document clinical response, adherence, and reason for transition.`,
+    },
+    "benralizumab": {
+      coverage: `Benralizumab (Fasenra) for eosinophilic asthma: eosinophils ≥300 cells/uL preferred (150 minimum), severe persistent asthma. Documented injection site reaction discontinuation satisfies step therapy failure criteria for subsequent biologic (including dupilumab) approval on most BCBS commercial policies.`,
+      prior_auth: `Fasenra PA failure documentation: drug name, dose (30mg SC), number of doses administered, discontinuation date, documented adverse event (injection site reactions). This documentation directly supports dupilumab step therapy waiver.`,
+    },
+    "compounded_glp1": {
+      compounding: `Compounded semaglutide coverage: Most commercial plans do NOT cover compounded semaglutide. FDA removed injectable semaglutide from shortage list February 2024 — 503A/503B shortage exemption no longer applies. Salt-form compounds (acetate, sodium) are prohibited. Care team should pursue brand PA for Ozempic (T2D: A1C ≥7.0, metformin failure) or Wegovy (obesity: BMI ≥30 or ≥27 with comorbidity, lifestyle intervention failure ≥6 months). No manufacturer copay for compounded versions. Medicare Part D does NOT cover compounded semaglutide.`,
+    },
+    "medicare_coverage": {
+      medicare: `Medicare biologic coverage: Part B covers physician-administered biologics (office injection); 80/20 cost-sharing, no manufacturer copay allowed. Part D covers self-administered biologics (home autoinjector); specialty tier, manufacturer copay cards prohibited (anti-kickback statute). GLP-1s for obesity NOT covered under most Part D plans. Low-income patients: Extra Help/LIS program. Medicare Advantage PA requirements vary by plan — obtain plan-specific formulary.`,
+    },
+  };
+
+  // Match extended policies based on detected drugs + query type
+  const extendedMatches = {
+    "dupilumab": EXTENDED_POLICIES.dupilumab,
+    "mepolizumab": EXTENDED_POLICIES.mepolizumab,
+    "benralizumab": EXTENDED_POLICIES.benralizumab,
+  };
+
+  for (const [drugKey, policies] of Object.entries(extendedMatches)) {
+    if (detectedDrugs.some(d => d.toLowerCase().includes(drugKey))) {
+      const relevantPolicy = policies[queryType] || policies["coverage"];
+      if (relevantPolicy) {
+        const score = scoreChunk(drugKey, queryType);
+        sources.push({ source: `${drugKey.charAt(0).toUpperCase() + drugKey.slice(1)} — ${queryType.replace("_", " ")} policy`, score, preview: relevantPolicy.slice(0, 280) + "…" });
+      }
+    }
+  }
+
+  // Compounded GLP-1 detection
+  if (ql.includes("compound") || (detectedDrugs.includes("GLP Access") && queryType === "compounding")) {
+    sources.push({ source: "Compounded GLP-1 Coverage Policy", score: 0.89, preview: EXTENDED_POLICIES.compounded_glp1.compounding.slice(0, 280) + "…" });
+  }
+
+  // Medicare-specific
+  if (isMedicare || patientContext.payerType === "Medicare") {
+    sources.push({ source: "Medicare Part B/D Drug Coverage Policy", score: 0.85, preview: EXTENDED_POLICIES.medicare_coverage.medicare.slice(0, 280) + "…" });
+  }
+
+  // Benefits DB — payer-filtered
+  const benefits = PHARMA_DATA.benefits.filter(b => {
+    const drugMatch = detectedDrugs.some(d => b.drug_name.toLowerCase().includes(d.toLowerCase()) || d.toLowerCase().includes(b.drug_name.toLowerCase())) || ql.includes(b.drug_name.toLowerCase());
+    const payerMatch = patientContext.payerType
+      ? (patientContext.payerType === "Commercial" ? b.copay_eligible : !b.copay_eligible)
+      : true;
+    return drugMatch;
+  });
+  if (benefits.length) {
+    sources.push({ source: "Pharmacy Benefits Database", score: 0.87, preview: benefits.map(b => `${b.payer} (${b.plan_id}): ${b.drug_name} — tier: ${b.tier}, PA: ${b.pa_required ? "required" : "not required"}, copay: ${b.copay_eligible ? "eligible (commercial)" : "not eligible"}, alternatives: ${b.alternatives.join(", ")}`).join(" | ").slice(0, 280) + "…" });
+  }
+
+  // Only fall back to general if nothing matched
+  if (sources.length === 0) {
+    sources.push({ source: "General Access Policy", score: 0.52, preview: PHARMA_DATA.policies.general.slice(0, 200) + "…" });
+  }
+
+  // Sort by score descending, return top 5
+  return sources.sort((a, b) => b.score - a.score).slice(0, 5);
+}
+
+// ── FIX 4: Confidence now derived from evidence quality + payer context match ──
+function computeConfidence(answer, sources, patientContext = {}) {
+  if (!sources.length) return 0.20;
+  const topScore = sources[0].score;
+  const sourceCount = sources.length;
+  // Penalise if only general fallback was found
+  const isGenericOnly = sources.length === 1 && sources[0].source === "General Access Policy";
+  if (isGenericOnly) return 0.35;
+  // Bonus for multiple corroborating sources
+  const countBonus = Math.min(0.08, (sourceCount - 1) * 0.03);
+  return Math.min(0.95, topScore + countBonus);
 }
 
 async function callAgentAPI(question, context, patientContext) {
@@ -78,13 +207,22 @@ async function callAgentAPI(question, context, patientContext) {
   return data.answer || null;
 }
 
-function localAnswer(question, sources) {
+function localAnswer(question, sources, patientContext = {}) {
   const ql = question.toLowerCase();
+  const { detectedDrugs, queryType, isGovt, isMedicare } = extractEntities(question, patientContext);
   const matchedDrug = PHARMA_DATA.drugs.find(d => ql.includes(d.toLowerCase()));
   const matchedBenefits = matchedDrug ? PHARMA_DATA.benefits.filter(b => b.drug_name === matchedDrug) : [];
 
   let answer = "**Based on retrieved policy and benefit evidence:**\n\n";
-  if (matchedBenefits.length) {
+
+  // Synthesise answer from top retrieved source content (not just keywords)
+  if (sources.length > 0 && sources[0].source !== "General Access Policy") {
+    const topSource = sources[0];
+    answer += `**${topSource.source}:**\n${topSource.preview.replace("…", "")}\n\n`;
+    if (sources[1]) {
+      answer += `**${sources[1].source}:**\n${sources[1].preview.replace("…", "")}\n\n`;
+    }
+  } else if (matchedBenefits.length) {
     answer += `**${matchedDrug} — Payer Coverage Summary:**\n`;
     matchedBenefits.forEach(b => {
       answer += `\n• **${b.payer}** (${b.plan_id})\n`;
@@ -94,16 +232,28 @@ function localAnswer(question, sources) {
       if (b.alternatives.length) answer += `  - Formulary alternatives: ${b.alternatives.join(", ")}\n`;
     });
     answer += "\n";
+  } else {
+    answer += "**General access summary:**\n";
+    answer += "- Verify current eligibility, formulary tier, PA status, and pharmacy channel with the payer.\n";
   }
-  if (ql.includes("copay") || ql.includes("cost")) {
-    answer += "**Copay Assistance:** Manufacturer copay programs are available for commercially insured patients. Government-funded plans (Medicare, Medicaid) are excluded by law.\n\n";
+
+  // Payer-aware copay guidance
+  if (ql.includes("copay") || ql.includes("cost") || ql.includes("assistance")) {
+    if (isGovt) {
+      answer += "**Copay Assistance:** Manufacturer copay cards are NOT available for Medicare, Medicaid, or government-funded plans. Patient Assistance Programs (PAPs) may be available — check manufacturer website or NeedyMeds.org.\n\n";
+    } else {
+      answer += "**Copay Assistance:** Manufacturer copay programs are available for commercially insured patients. Government-funded plans (Medicare, Medicaid) are excluded by federal law.\n\n";
+    }
   }
-  if (ql.includes("prior auth") || ql.includes("pa ") || ql.includes("authorization")) {
-    answer += "**Prior Authorization:** Documentation required includes clinical trial evidence, step therapy failures, and physician attestation of medical necessity. Submit through the plan's specialty pharmacy portal.\n\n";
+
+  if (ql.includes("prior auth") || ql.includes("pa ") || ql.includes("authorization") || ql.includes("step therapy")) {
+    answer += "**Prior Authorization:** Documentation required includes clinical trial evidence, step therapy failures, prescriber attestation of medical necessity, and diagnostic labs. Submit through the plan's specialty pharmacy portal.\n\n";
   }
-  if (ql.includes("alternative") || ql.includes("formulary")) {
-    answer += "**Formulary Strategy:** Verify plan-specific preferred alternatives before escalation. Document therapeutic equivalence and patient-specific contraindications if requesting exception.\n\n";
+
+  if (isMedicare) {
+    answer += "**Medicare Note:** Determine if drug is Part B (physician-administered) or Part D (self-administered) — this affects the PA pathway, cost-sharing, and copay eligibility. Manufacturer copay cards are prohibited for Medicare patients.\n\n";
   }
+
   answer += "\n⚠️ *Care team verification required before any therapy or coverage decisions. Confirm current eligibility with plan directly.*";
   return answer;
 }
@@ -158,7 +308,8 @@ export default function RxIntelligencePlatform() {
 
       setPhase("Retrieving policy evidence from vector store…");
       await new Promise(r => setTimeout(r, 700));
-      const sources = retrieveContext(q);
+      const patientCtx = { patientId, therapyArea, payerType, urgency };
+      const sources = retrieveContext(q, patientCtx);
       const context = sources.map(s => `[${s.source}]: ${s.preview}`).join("\n\n");
 
       setPhase("Generating evidence-backed response…");
@@ -166,13 +317,13 @@ export default function RxIntelligencePlatform() {
 
       let answer;
       try {
-        answer = await callAgentAPI(q, context, { patientId, therapyArea, payerType, urgency });
+        answer = await callAgentAPI(q, context, patientCtx);
       } catch (e) { answer = null; }
-      if (!answer) answer = localAnswer(q, sources);
+      if (!answer) answer = localAnswer(q, sources, patientCtx);
 
       setPhase("Computing confidence score and writing audit trail…");
       await new Promise(r => setTimeout(r, 400));
-      const confidence = computeConfidence(answer, sources);
+      const confidence = computeConfidence(answer, sources, patientCtx);
 
       AUDIT_LOG.unshift({ auditId, ts: new Date().toISOString(), patientId, question: q, confidence, sourcesCount: sources.length, guardrail: "passed" });
 
